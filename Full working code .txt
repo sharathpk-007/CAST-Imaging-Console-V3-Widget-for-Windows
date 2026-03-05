@@ -1,0 +1,626 @@
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+import psutil
+import time
+import os
+import re
+import subprocess
+import xml.etree.ElementTree as ET
+import traceback # For more detailed error logging
+
+# Attempt to import psycopg2 for PostgreSQL database connection
+try:
+    import psycopg2
+    from psycopg2 import sql # For safe query construction, if needed later
+    PSYCOPG2_AVAILABLE = True
+except ImportError:
+    PSYCOPG2_AVAILABLE = False
+
+# --- GUI Setup ---
+root = tk.Tk()
+root.title("CAST Imaging Monitor")
+root.geometry("1100x950")
+
+# --- Tabbed Interface (Notebook) ---
+notebook = ttk.Notebook(root)
+notebook.pack(fill="both", expand=True, padx=5, pady=5)
+
+# --- Tab 1: CAST Monitor ---
+monitor_tab = tk.Frame(notebook)
+notebook.add(monitor_tab, text="CAST Monitor")
+
+# --- Tab 2: Common-data ---
+aip_tab = tk.Frame(notebook)
+notebook.add(aip_tab, text="Common-data")
+
+# --- Tab 3: Delivery ---
+delivery_tab = tk.Frame(notebook)
+notebook.add(delivery_tab, text="Delivery")
+
+# --- Tab 4: Database (NEW) ---
+db_tab = tk.Frame(notebook)
+notebook.add(db_tab, text="Database")
+
+
+# --- Global Variables for Data ---
+SERVICE_LOG_PATHS = {}
+parsed_config_values_global = {}
+parsed_index_data_delivery = None
+db_connection = None
+db_selected_schema = tk.StringVar()
+
+# Globals for Database Tab UI elements that need to be managed
+results_frame = None 
+db_results_tree = None
+db_results_tree_scrollbar_y = None
+db_results_tree_scrollbar_x = None
+
+
+# --- Style Configuration (centralized) ---
+style = ttk.Style()
+style.configure("Treeview", rowheight=25)
+style.configure("Hyperlink.TLabel", foreground="blue", font=("Arial", 10, "underline"))
+style.configure("Error.TLabel", foreground="red")
+
+
+# --- Content for CAST Monitor Tab (Tab 1) ---
+main_canvas = tk.Canvas(monitor_tab); main_scrollbar = tk.Scrollbar(monitor_tab, orient="vertical", command=main_canvas.yview)
+main_frame = tk.Frame(main_canvas); main_frame.bind("<Configure>", lambda e: main_canvas.configure(scrollregion=main_canvas.bbox("all")))
+main_canvas.create_window((0, 0), window=main_frame, anchor="nw"); main_canvas.configure(yscrollcommand=main_scrollbar.set)
+main_canvas.pack(side="left", fill="both", expand=True); main_scrollbar.pack(side="right", fill="y")
+columns = ("Service Name", "Status"); tree = ttk.Treeview(main_frame, columns=columns, show='headings', height=7, style="Treeview") 
+tree.heading("Service Name", text="Service Name"); tree.heading("Status", text="Status"); tree.pack(pady=5, padx=20, fill=tk.X, expand=False)
+for tag, color in {"Running": "green", "Stopped": "red", "StopPending": "orange", "Not Found": "gray", "NotFound": "gray"}.items(): tree.tag_configure(tag, foreground=color)
+status_icons = {"Running": "Running", "Stopped": "Stopped", "StopPending": "Stopping", "Not Found": "Not Found"}
+SERVICE_NAMES = ["CAST Imaging Analysis Node", "CAST Imaging Authentication", "CAST Imaging Console", "CAST Imaging Dashboards", "CAST Imaging Control Panel", "CAST Imaging Gateway", "CAST Imaging SSO", "CAST Imaging Viewer AI Manager", "CAST Imaging Viewer Backend", "CAST Imaging Viewer ETL", "CAST Imaging Viewer Frontend", "CAST Imaging Viewer Neo4j Graph DB"]
+config_frame = tk.Frame(main_frame); config_frame.pack(pady=2)
+tk.Label(config_frame, text="Select config-all.conf File:").grid(row=0, column=0, padx=5)
+config_entry = ttk.Entry(config_frame, width=70); config_entry.grid(row=0, column=1, padx=5)
+tk.Button(config_frame, text="Browse", command=lambda: (config_entry.delete(0, tk.END), config_entry.insert(0, filedialog.askopenfilename(filetypes=[("Config Files", "config-all.conf")], title="Select config-all.conf")))).grid(row=0, column=2, padx=5)
+tk.Label(main_frame, text="Example: ...\\configuration\\config-all.conf", fg="gray").pack(pady=(0,2))
+apply_btn = tk.Button(main_frame, text="Execute & Refresh Data", bg="#1c87c9", fg="white")
+apply_btn.pack(pady=2)
+log_display_frame = tk.Frame(main_frame); log_display_frame.pack(padx=10, pady=5, fill=tk.BOTH, expand=True)
+log_scrollbar_y = tk.Scrollbar(log_display_frame, orient=tk.VERTICAL); log_scrollbar_y.pack(side=tk.RIGHT, fill=tk.Y)
+log_display = tk.Text(log_display_frame, width=140, height=10, font=("Courier New", 10), yscrollcommand=log_scrollbar_y.set, wrap=tk.WORD)
+log_display.pack(side=tk.LEFT, fill=tk.BOTH, expand=True); log_scrollbar_y.config(command=log_display.yview)
+button_frame = tk.Frame(main_frame); button_frame.pack(pady=2, fill=tk.X)
+
+
+# --- Content and Logic for Common-data Tab (Tab 2) ---
+common_data_path_label_var = tk.StringVar(); common_data_path_label_var.set("SHARED_FOLDER path will be shown here after 'Execute'.")
+path_display_label = ttk.Label(aip_tab, textvariable=common_data_path_label_var, wraplength=1000, font=("Arial", 10, "italic")); path_display_label.pack(pady=10, padx=10, fill=tk.X)
+common_data_canvas = tk.Canvas(aip_tab); common_data_scrollbar = tk.Scrollbar(aip_tab, orient="vertical", command=common_data_canvas.yview)
+folder_links_container_frame = ttk.Frame(common_data_canvas)
+folder_links_container_frame.bind("<Configure>", lambda e: common_data_canvas.configure(scrollregion=common_data_canvas.bbox("all")))
+common_data_canvas.create_window((0, 0), window=folder_links_container_frame, anchor="nw"); common_data_canvas.configure(yscrollcommand=common_data_scrollbar.set)
+common_data_canvas.pack(side="left", fill="both", expand=True, padx=10); common_data_scrollbar.pack(side="right", fill="y", padx=(0,10))
+
+
+# --- Content and Logic for Delivery Tab (Tab 3) ---
+delivery_folder_path_label_var = tk.StringVar()
+delivery_folder_path_label_var.set("DELIVERY_FOLDER path will be shown here after 'Execute'.")
+delivery_path_display_label = ttk.Label(delivery_tab, textvariable=delivery_folder_path_label_var, wraplength=1000, font=("Arial", 10, "italic"))
+delivery_path_display_label.pack(pady=(10,0), padx=10, fill=tk.X)
+
+delivery_search_frame = ttk.Frame(delivery_tab)
+delivery_search_frame.pack(pady=5, padx=10, fill=tk.X)
+ttk.Label(delivery_search_frame, text="Search App Name:").pack(side=tk.LEFT, padx=(0,5))
+delivery_search_entry_var = tk.StringVar()
+delivery_search_entry = ttk.Entry(delivery_search_frame, textvariable=delivery_search_entry_var, width=50)
+delivery_search_entry.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=5)
+delivery_search_button = ttk.Button(delivery_search_frame, text="Search")
+delivery_search_button.pack(side=tk.LEFT, padx=5)
+delivery_clear_button = ttk.Button(delivery_search_frame, text="Clear")
+delivery_clear_button.pack(side=tk.LEFT, padx=5)
+
+delivery_apps_canvas = tk.Canvas(delivery_tab)
+delivery_apps_scrollbar = tk.Scrollbar(delivery_tab, orient="vertical", command=delivery_apps_canvas.yview)
+delivery_apps_container_frame = ttk.Frame(delivery_apps_canvas)
+delivery_apps_container_frame.bind("<Configure>", lambda e: delivery_apps_canvas.configure(scrollregion=delivery_apps_canvas.bbox("all")))
+delivery_apps_canvas.create_window((0, 0), window=delivery_apps_container_frame, anchor="nw")
+delivery_apps_canvas.configure(yscrollcommand=delivery_apps_scrollbar.set)
+delivery_apps_canvas.pack(side="left", fill="both", expand=True, padx=10, pady=(0,10))
+delivery_apps_scrollbar.pack(side="right", fill="y", padx=(0,10), pady=(0,10))
+
+
+# --- Helper Functions ---
+def open_folder(path_to_open):
+    try:
+        normalized_path = os.path.normpath(path_to_open)
+        if os.path.exists(normalized_path):
+            if os.name == 'nt': os.startfile(normalized_path)
+            elif os.name == 'posix':
+                if subprocess.call(['which', 'xdg-open'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0: subprocess.call(['xdg-open', normalized_path])
+                elif subprocess.call(['which', 'open'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0: subprocess.call(['open', normalized_path])
+                else: messagebox.showwarning("Cannot Open", f"Could not find xdg-open or open.")
+            else: messagebox.showwarning("Cannot Open", f"Unsupported OS.")
+        else: messagebox.showerror("Error", f"Path does not exist:\n{normalized_path}")
+    except Exception as e: messagebox.showerror("Error", f"Could not open folder: {path_to_open}\n{str(e)}")
+
+# --- Functions for Common-data Tab ---
+def populate_common_data_tab():
+    for widget in folder_links_container_frame.winfo_children(): widget.destroy()
+    if not parsed_config_values_global:
+        common_data_path_label_var.set("Configuration not processed yet.")
+        ttk.Label(folder_links_container_frame, text="Load config and click 'Execute' on CAST Monitor tab.").pack(pady=5)
+    else:
+        shared_folder_path = parsed_config_values_global.get("SHARED_FOLDER")
+        if shared_folder_path is None: common_data_path_label_var.set("SHARED_FOLDER key not found in config-all.conf."); ttk.Label(folder_links_container_frame, text="Ensure SHARED_FOLDER is defined.").pack(pady=5)
+        elif not shared_folder_path.strip(): common_data_path_label_var.set("SHARED_FOLDER path is empty in config-all.conf."); ttk.Label(folder_links_container_frame, text="Provide a valid path for SHARED_FOLDER.").pack(pady=5)
+        elif not os.path.exists(shared_folder_path) or not os.path.isdir(shared_folder_path): common_data_path_label_var.set(f"SHARED_FOLDER (Invalid Path): {shared_folder_path}"); ttk.Label(folder_links_container_frame, text=f"Path does not exist or is not a directory.").pack(pady=5)
+        else:
+            common_data_path_label_var.set(f"SHARED_FOLDER: {shared_folder_path}")
+            try:
+                sub_items = os.listdir(shared_folder_path); found_folders = False
+                for item_name in sorted(sub_items, key=str.lower):
+                    full_item_path = os.path.join(shared_folder_path, item_name)
+                    if os.path.isdir(full_item_path):
+                        found_folders = True; 
+                        link = ttk.Label(folder_links_container_frame, text=item_name, style="Hyperlink.TLabel", cursor="hand2")
+                        link.pack(anchor="w", padx=10, pady=2); link.bind("<Button-1>", lambda e, p=full_item_path: open_folder(p))
+                if not found_folders: ttk.Label(folder_links_container_frame, text="No sub-folders found.").pack(pady=5)
+            except Exception as e: ttk.Label(folder_links_container_frame, text=f"Error accessing path: {str(e)}").pack(pady=5)
+    folder_links_container_frame.update_idletasks(); common_data_canvas.config(scrollregion=common_data_canvas.bbox("all"))
+
+# --- Functions for Delivery Tab ---
+def parse_index_xml(xml_file_path):
+    entries = []
+    try:
+        tree = ET.parse(xml_file_path)
+        root_xml = tree.getroot()
+        for entry_elem in root_xml.findall('.//entry'):
+            guid = entry_elem.get('key')
+            app_name = entry_elem.text
+            if guid and app_name:
+                entries.append({'guid': guid.strip(), 'name': app_name.strip()})
+    except ET.ParseError as e:
+        messagebox.showerror("XML Parse Error", f"Error parsing {os.path.basename(xml_file_path)}:\n{e}")
+        raise
+    return entries
+
+def populate_delivery_tab(search_term="", force_reparse_index=False):
+    global parsed_index_data_delivery
+
+    for widget in delivery_apps_container_frame.winfo_children(): widget.destroy()
+
+    delivery_folder = parsed_config_values_global.get("DELIVERY_FOLDER", "")
+
+    if not delivery_folder:
+        delivery_folder_path_label_var.set("DELIVERY_FOLDER path not found in config or config not processed yet.")
+        ttk.Label(delivery_apps_container_frame, text="Load config and click 'Execute' on CAST Monitor tab.").pack(pady=5)
+        delivery_apps_container_frame.update_idletasks(); delivery_apps_canvas.config(scrollregion=delivery_apps_canvas.bbox("all"))
+        return
+
+    delivery_folder_path_label_var.set(f"DELIVERY_FOLDER: {delivery_folder}")
+
+    if not os.path.exists(delivery_folder) or not os.path.isdir(delivery_folder):
+        ttk.Label(delivery_apps_container_frame, text=f"DELIVERY_FOLDER path is invalid: {delivery_folder}").pack(pady=5)
+        parsed_index_data_delivery = []
+        delivery_apps_container_frame.update_idletasks(); delivery_apps_canvas.config(scrollregion=delivery_apps_canvas.bbox("all"))
+        return
+
+    index_xml_path = os.path.join(delivery_folder, "index.xml")
+
+    if force_reparse_index or parsed_index_data_delivery is None:
+        parsed_index_data_delivery = []
+        if not os.path.exists(index_xml_path):
+            ttk.Label(delivery_apps_container_frame, text=f"index.xml not found in: {delivery_folder}").pack(pady=5)
+        else:
+            try:
+                parsed_index_data_delivery = parse_index_xml(index_xml_path)
+            except Exception:
+                ttk.Label(delivery_apps_container_frame, text=f"Failed to load or parse index.xml from {delivery_folder}.").pack(pady=5)
+    
+    current_data_to_display = []
+    search_term_lower = search_term.strip().lower()
+    if parsed_index_data_delivery:
+        if search_term_lower:
+            current_data_to_display = [entry for entry in parsed_index_data_delivery if search_term_lower in entry['name'].lower()]
+        else:
+            current_data_to_display = list(parsed_index_data_delivery)
+
+    if not current_data_to_display:
+        if search_term_lower and parsed_index_data_delivery:
+             ttk.Label(delivery_apps_container_frame, text=f"No applications found matching '{search_term}'.").pack(pady=5)
+        elif not parsed_index_data_delivery and (force_reparse_index or parsed_index_data_delivery is None):
+            pass
+        elif not parsed_index_data_delivery:
+            ttk.Label(delivery_apps_container_frame, text="No application data available. Check index.xml or 'Execute' config.").pack(pady=5)
+        elif parsed_index_data_delivery :
+            ttk.Label(delivery_apps_container_frame, text="No applications listed in index.xml.").pack(pady=5)
+
+    for entry in current_data_to_display:
+        app_name = entry['name']
+        guid_without_braces = entry['guid'] 
+        
+        guid_folder_name_with_braces = f"{{{guid_without_braces}}}" 
+        guid_folder_path = os.path.join(delivery_folder, guid_folder_name_with_braces)
+        
+        item_frame = ttk.Frame(delivery_apps_container_frame)
+        item_frame.pack(fill=tk.X, pady=2, padx=5)
+        
+        ttk.Label(item_frame, text=f"App: {app_name}", wraplength=450).pack(side=tk.LEFT, padx=(0,10), anchor='w')
+        
+        guid_link = ttk.Label(item_frame, text=guid_without_braces, foreground="blue", cursor="hand2", font=("Arial", 10, "underline"), wraplength=350)
+        
+        guid_link.pack(side=tk.LEFT, anchor='w'); 
+        guid_link.bind("<Button-1>", lambda e, p=guid_folder_path: open_folder(p))
+
+    delivery_apps_container_frame.update_idletasks(); delivery_apps_canvas.config(scrollregion=delivery_apps_canvas.bbox("all"))
+
+delivery_search_button.config(command=lambda: populate_delivery_tab(search_term=delivery_search_entry_var.get()))
+delivery_clear_button.config(command=lambda: (delivery_search_entry_var.set(""), populate_delivery_tab()))
+delivery_search_entry.bind("<Return>", lambda event: populate_delivery_tab(search_term=delivery_search_entry_var.get()))
+
+
+
+# --- Functions for Database Tab ---
+def db_clear_and_recreate_results_tree():
+    global db_results_tree, db_results_tree_scrollbar_y, db_results_tree_scrollbar_x, results_frame
+
+    if not results_frame: # Ensure parent frame exists
+        print("Error: results_frame not initialized for db_results_tree. Cannot recreate.")
+        return None
+
+    # Destroy existing tree and scrollbars if they exist
+    if db_results_tree is not None and db_results_tree.winfo_exists():
+        db_results_tree.destroy()
+    if db_results_tree_scrollbar_y is not None and db_results_tree_scrollbar_y.winfo_exists():
+        db_results_tree_scrollbar_y.destroy()
+    if db_results_tree_scrollbar_x is not None and db_results_tree_scrollbar_x.winfo_exists():
+        db_results_tree_scrollbar_x.destroy()
+
+    # Recreate scrollbars and tree, assign to globals
+    db_results_tree_scrollbar_y = ttk.Scrollbar(results_frame, orient="vertical")
+    db_results_tree_scrollbar_x = ttk.Scrollbar(results_frame, orient="horizontal")
+    db_results_tree = ttk.Treeview(results_frame, 
+                                   yscrollcommand=db_results_tree_scrollbar_y.set, 
+                                   xscrollcommand=db_results_tree_scrollbar_x.set, 
+                                   show="headings") 
+    db_results_tree_scrollbar_y.config(command=db_results_tree.yview)
+    db_results_tree_scrollbar_x.config(command=db_results_tree.xview)
+    
+    db_results_tree_scrollbar_y.pack(side=tk.RIGHT, fill=tk.Y)
+    db_results_tree_scrollbar_x.pack(side=tk.BOTTOM, fill=tk.X)
+    db_results_tree.pack(fill="both", expand=True)
+    return db_results_tree # Return the new tree instance
+
+def connect_db():
+    global db_connection, PSYCOPG2_AVAILABLE, db_entries, db_status_label_var, root
+    global db_connect_button, db_disconnect_button, db_execute_query_button, db_schema_combobox
+    global db_table_list
+    
+    if not PSYCOPG2_AVAILABLE: messagebox.showerror("Missing Library", "psycopg2 not installed."); return
+    if db_connection: disconnect_db() 
+    
+    if PSYCOPG2_AVAILABLE: db_clear_and_recreate_results_tree()
+    db_table_list.delete(0, tk.END)
+    try:
+        host, port, dbname, user, password = (db_entries[k].get() for k in ['host', 'port', 'database_name', 'username', 'password'])
+        if not all([host, port, dbname, user]): messagebox.showerror("Input Error", "Host, Port, Database Name, and Username are required."); return
+        
+        db_status_label_var.set(f"Status: Connecting to {dbname} on {host}:{port}..."); root.update_idletasks()
+        db_connection = psycopg2.connect(host=host, port=port, dbname=dbname, user=user, password=password, connect_timeout=5)
+        db_status_label_var.set(f"Status: Connected to {dbname} on {host}:{port}")
+        db_connect_button.config(state=tk.DISABLED); db_disconnect_button.config(state=tk.NORMAL); db_execute_query_button.config(state=tk.NORMAL)
+        db_schema_combobox.config(state="readonly") 
+        if db_schema_combobox.get(): load_tables_for_schema()
+
+    except psycopg2.Error as e:
+        db_status_label_var.set("Status: Connection Failed"); messagebox.showerror("Database Error", f"Could not connect: {e}")
+        if db_connection: db_connection.close(); db_connection = None
+    except Exception as e:
+        db_status_label_var.set("Status: Error"); messagebox.showerror("Error", f"An unexpected error: {e}")
+        if db_connection: db_connection.close(); db_connection = None
+
+def disconnect_db():
+    global db_connection, db_status_label_var, db_connect_button, db_disconnect_button
+    global db_execute_query_button, db_table_list, db_schema_combobox
+    if db_connection:
+        try: db_connection.close()
+        except psycopg2.Error: pass 
+        db_connection = None
+    db_status_label_var.set("Status: Disconnected")
+    db_connect_button.config(state=tk.NORMAL); db_disconnect_button.config(state=tk.DISABLED); db_execute_query_button.config(state=tk.DISABLED)
+    db_table_list.delete(0, tk.END)
+    if PSYCOPG2_AVAILABLE: 
+         db_clear_and_recreate_results_tree() 
+    db_schema_combobox.set(''); db_schema_combobox.config(state="disabled")
+
+def load_tables_for_schema(event=None):
+    global db_connection, PSYCOPG2_AVAILABLE, db_selected_schema, db_table_list
+    if not db_connection or not PSYCOPG2_AVAILABLE: return
+    schema_name = db_selected_schema.get()
+    if not schema_name: return
+    db_table_list.delete(0, tk.END)
+    if PSYCOPG2_AVAILABLE:
+        db_clear_and_recreate_results_tree() 
+    try:
+        with db_connection.cursor() as cur:
+            query = sql.SQL("SELECT table_name FROM information_schema.tables WHERE table_schema = %s ORDER BY table_name;")
+            cur.execute(query, (schema_name,))
+            tables = [row[0] for row in cur.fetchall()]
+            if tables:
+                for table in tables: db_table_list.insert(tk.END, table)
+            else:
+                db_table_list.insert(tk.END, "(No tables found)")
+    except psycopg2.Error as e: messagebox.showerror("DB Error", f"Error fetching tables for schema '{schema_name}':\n{e}")
+    except Exception as e: messagebox.showerror("Error", f"Unexpected error fetching tables:\n{e}")
+
+def display_table_schema(event=None): 
+    global db_connection, PSYCOPG2_AVAILABLE, db_table_list, db_selected_schema, db_results_tree
+    if not db_connection or not PSYCOPG2_AVAILABLE: return
+    selected_indices = db_table_list.curselection()
+    if not selected_indices: return
+    
+    table_name = db_table_list.get(selected_indices[0])
+    schema_name = db_selected_schema.get()
+    if not table_name or not schema_name or table_name == "(No tables found)": return
+
+    current_tree = db_clear_and_recreate_results_tree() 
+    if not current_tree: return
+    current_tree['show'] = 'headings'
+
+    try:
+        with db_connection.cursor() as cur:
+            query = sql.SQL("SELECT column_name, data_type, is_nullable FROM information_schema.columns WHERE table_schema = %s AND table_name = %s ORDER BY ordinal_position;")
+            cur.execute(query, (schema_name, table_name))
+            columns_info = cur.fetchall()
+            if columns_info:
+                col_names = ["Column Name", "Data Type", "Nullable"]
+                current_tree["columns"] = col_names; current_tree["displaycolumns"] = col_names
+                for col in col_names: current_tree.heading(col, text=col); current_tree.column(col, width=150, anchor="w")
+                for row_data in columns_info: current_tree.insert("", tk.END, values=row_data)
+            else:
+                current_tree["columns"] = ("Status",); current_tree.heading("Status", text="Status")
+                current_tree.insert("",tk.END, values=(f"No column info for {schema_name}.{table_name}",))
+    except psycopg2.Error as e: messagebox.showerror("DB Error", f"Error fetching schema for {schema_name}.{table_name}:\n{e}")
+    except Exception as e: messagebox.showerror("Error", f"Unexpected error fetching table schema:\n{e}")
+
+def execute_db_query():
+    global db_connection, PSYCOPG2_AVAILABLE, db_query_text, db_results_tree
+    if not db_connection or not PSYCOPG2_AVAILABLE: messagebox.showerror("Error", "Not connected to database."); return
+    query_str = db_query_text.get("1.0", tk.END).strip()
+    if not query_str: messagebox.showwarning("Input Error", "Query cannot be empty."); return
+    if not query_str.lower().lstrip().startswith("select"): messagebox.showerror("Query Error", "Only SELECT statements are allowed."); return
+        
+    current_tree = db_clear_and_recreate_results_tree()
+    if not current_tree: return
+    current_tree['show'] = 'headings'
+
+    try:
+        with db_connection.cursor() as cur:
+            cur.execute(query_str) 
+            if cur.description: 
+                col_names = [desc[0] for desc in cur.description]
+                current_tree["columns"] = col_names; current_tree["displaycolumns"] = col_names 
+                for col in col_names: current_tree.heading(col, text=col); current_tree.column(col, width=100, anchor="w")
+                rows_fetched = 0; max_rows_to_display = 500 
+                for row_data in cur:
+                    current_tree.insert("", tk.END, values=row_data); rows_fetched += 1
+                    if rows_fetched >= max_rows_to_display:
+                        current_tree.insert("", tk.END, values=("...",)*(len(col_names))); current_tree.insert("", tk.END, values=(f"(Displayed first {max_rows_to_display} rows)",)*(len(col_names))); break
+                if rows_fetched == 0: current_tree.insert("",tk.END, values=("(No rows returned)",)*(len(col_names) if col_names else 1) )
+            else: 
+                status_message = f"Query executed. Rows affected: {cur.rowcount}" if cur.rowcount != -1 else "Query executed."
+                current_tree["columns"] = ("Status",); current_tree.heading("Status", text="Status"); current_tree.insert("",tk.END, values=(status_message,))
+        db_connection.commit() 
+    except psycopg2.Error as e: messagebox.showerror("Query Execution Error", f"Error executing query:\n{e}"); db_connection.rollback() 
+    except Exception as e: messagebox.showerror("Error", f"Unexpected error executing query:\n{e}"); 
+    if db_connection: db_connection.rollback()
+
+
+# --- Content and Logic for Database Tab (Tab 4 - NEW UI) ---
+def setup_db_tab_ui():
+    global db_selected_schema, db_entries, db_connect_button, db_disconnect_button
+    global db_status_label_var, db_schema_combobox, db_table_list
+    global db_query_text, db_execute_query_button
+    global results_frame # Crucial: Make results_frame global
+    
+    db_top_frame = ttk.Frame(db_tab) 
+    db_top_frame.pack(fill="x", padx=10, pady=5) 
+
+    db_form_frame = ttk.LabelFrame(db_top_frame, text="Connection Details", padding=(10, 5)) 
+    db_form_frame.pack(side=tk.LEFT, padx=(0,10), fill="x", expand=True) 
+    
+    db_entries = {}
+    fields = ["Host:", "Port:", "Database Name:", "Username:", "Password:"]
+    defaults = ["localhost", "5432", "postgres", "postgres", ""]
+    for i, field in enumerate(fields):
+        ttk.Label(db_form_frame, text=field).grid(row=i, column=0, padx=5, pady=2, sticky="w")
+        entry_var = tk.StringVar(value=defaults[i])
+        entry_widget = ttk.Entry(db_form_frame, textvariable=entry_var, width=30)
+        if field == "Password:": entry_widget.config(show="*")
+        entry_widget.grid(row=i, column=1, padx=5, pady=2, sticky="ew")
+        db_entries[field[:-1].lower().replace(" ", "_")] = entry_var
+    db_form_frame.columnconfigure(1, weight=1)
+
+    db_action_frame = ttk.Frame(db_top_frame)
+    db_action_frame.pack(side=tk.LEFT, fill="y", padx=5)
+
+    db_connect_button = ttk.Button(db_action_frame, text="Connect") 
+    db_connect_button.pack(pady=2, fill="x")
+    db_disconnect_button = ttk.Button(db_action_frame, text="Disconnect", state=tk.DISABLED) 
+    db_disconnect_button.pack(pady=2, fill="x")
+
+    db_status_label_var = tk.StringVar(); db_status_label_var.set("Status: Disconnected")
+    db_status_label = ttk.Label(db_tab, textvariable=db_status_label_var, relief=tk.SUNKEN, anchor="w", padding=5)
+    db_status_label.pack(fill="x", padx=10, pady=(0,5))
+
+    db_paned_window = ttk.PanedWindow(db_tab, orient=tk.HORIZONTAL)
+    db_paned_window.pack(fill="both", expand=True, padx=10, pady=5)
+
+    db_schema_table_frame = ttk.Frame(db_paned_window, width=250) 
+    db_paned_window.add(db_schema_table_frame, weight=1) 
+
+    ttk.Label(db_schema_table_frame, text="Select Schema:").pack(pady=(0,2), anchor="w")
+    db_schema_combobox = ttk.Combobox(db_schema_table_frame, textvariable=db_selected_schema, state="disabled", values=["aip_config", "aip_node", "admin_center", "analysis_node", "control_panel"])
+    db_schema_combobox.pack(fill="x", pady=(0,5))
+    db_schema_combobox.bind("<<ComboboxSelected>>", load_tables_for_schema)
+
+    ttk.Label(db_schema_table_frame, text="Tables:").pack(pady=(5,2), anchor="w")
+    db_table_list_frame = ttk.Frame(db_schema_table_frame)
+    db_table_list_frame.pack(fill="both", expand=True)
+    db_table_list_scrollbar = ttk.Scrollbar(db_table_list_frame, orient="vertical")
+    db_table_list = tk.Listbox(db_table_list_frame, yscrollcommand=db_table_list_scrollbar.set, exportselection=False)
+    db_table_list_scrollbar.config(command=db_table_list.yview)
+    db_table_list_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+    db_table_list.pack(side=tk.LEFT, fill="both", expand=True)
+    db_table_list.bind('<<ListboxSelect>>', display_table_schema)
+
+    db_query_results_frame = ttk.Frame(db_paned_window)
+    db_paned_window.add(db_query_results_frame, weight=3)
+
+    query_frame = ttk.LabelFrame(db_query_results_frame, text="SQL Query", padding=5)
+    query_frame.pack(fill="x", pady=(0,5))
+    
+    db_query_text = tk.Text(query_frame, height=5, wrap=tk.WORD, font=("Courier New", 9))
+    db_query_text.pack(fill="x", expand=True, side=tk.LEFT, padx=(0,5))
+    db_execute_query_button = ttk.Button(query_frame, text="Execute", state=tk.DISABLED) 
+    db_execute_query_button.pack(side=tk.LEFT, anchor="center")
+
+    results_frame = ttk.LabelFrame(db_query_results_frame, text="Query Results / Table Schema", padding=5) 
+    results_frame.pack(fill="both", expand=True)
+   
+    if not PSYCOPG2_AVAILABLE:
+        initial_db_message = "Python PostgreSQL adapter 'psycopg2' is not installed.\n" \
+                             "Please install it (e.g., 'pip install psycopg2-binary') to use this feature.\n\n" \
+                             "Database functionality will be disabled."
+        missing_lib_label = ttk.Label(results_frame, text=initial_db_message, style="Error.TLabel", wraplength=400, justify=tk.CENTER)
+        missing_lib_label.pack(pady=20, padx=10, fill="both", expand=True)
+        db_connect_button.config(state=tk.DISABLED) 
+    else:
+        db_clear_and_recreate_results_tree() # Initial creation of the tree
+
+    db_connect_button.config(command=connect_db)
+    db_disconnect_button.config(command=disconnect_db)
+    if PSYCOPG2_AVAILABLE: 
+        db_execute_query_button.config(command=execute_db_query)
+
+setup_db_tab_ui()
+
+
+# --- Core Logic Functions ---
+def parse_config_all_conf(conf_path):
+    raw_config, resolved_config = {}, {}; 
+    expected_keys = ["imaging.root", "imaging.viewer.log.dir", "INSTALL_DIR", "DATA_DIR", "AIP_INSTALLDIR", "SHARED_FOLDER", "DELIVERY_FOLDER", "SOURCES_FOLDER_LOCATION"]
+    extracted_values = {key: "" for key in expected_keys}
+    try:
+        with open(conf_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip(); 
+                if not line or line.startswith("#"): continue
+                if "=" in line:
+                    key, value = line.split("=", 1); key = key.strip(); value = value.strip().strip('"').strip("'")
+                    pk = key[4:] if key.startswith("env.") or key.startswith("sys.") else key; raw_config[pk] = value; 
+                    if key not in raw_config: raw_config[key] = value
+        var_pattern = re.compile(r"\$\{([^}]+)\}|\%([^%]+)\%")
+        def resolve(val, cfg):
+            for _ in range(10):
+                orig_val, matches = val, list(var_pattern.finditer(val)); 
+                if not matches: break
+                for m in reversed(matches): vk = (m.group(1) or m.group(2)).split(':',1)[-1]; 
+                if vk in cfg: val = val[:m.start()] + cfg[vk] + val[m.end():]
+                if val == orig_val and matches: break
+            return val
+        for k, v in raw_config.items(): resolved_config[k] = resolve(v, raw_config)
+        for k, v in resolved_config.items(): resolved_config[k] = resolve(v, resolved_config)
+        for ek in expected_keys: extracted_values[ek] = resolved_config.get(ek, resolve(raw_config.get(ek, ""), resolved_config) if raw_config.get(ek) else "")
+    except FileNotFoundError: messagebox.showerror("Error", f"Config file not found: {conf_path}"); return {k: "" for k in extracted_values}
+    except Exception as e: messagebox.showerror("Error", f"Failed to parse config: {str(e)}"); return {k: "" for k in extracted_values}
+    return extracted_values
+
+def update_all_data_sources():
+    global SERVICE_LOG_PATHS, parsed_config_values_global, parsed_index_data_delivery
+    try:
+        conf_path = config_entry.get().strip()
+        if not conf_path or not os.path.exists(conf_path):
+            messagebox.showerror("Error", f"Invalid config-all.conf path: {conf_path}")
+            parsed_config_values_global, SERVICE_LOG_PATHS, parsed_index_data_delivery = {}, {}, None
+            populate_common_data_tab(); populate_delivery_tab(force_reparse_index=True); refresh_table()
+            return
+        parsed_config_values_global = parse_config_all_conf(conf_path)
+        install_dir = parsed_config_values_global.get("INSTALL_DIR", "")
+        base_dir_others = parsed_config_values_global.get("imaging.root", "") or parsed_config_values_global.get("DATA_DIR", "")
+        if not base_dir_others and not install_dir: messagebox.showwarning("Config Warning", "Key directories (INSTALL_DIR, imaging.root, DATA_DIR) not found. Many log paths might be incorrect.")
+        elif not base_dir_others: messagebox.showwarning("Config Warning", "'imaging.root'/'DATA_DIR' not found. Some log paths may be incorrect.")
+        viewer_root, viewer_logs = "CAST-IMAGING-Viewer", "logs"; viewer_ai_log, viewer_be_log, viewer_etl_log, viewer_fe_log, viewer_n4j_log = "", "", "", "", ""
+        if install_dir:
+            base_viewer_logs = os.path.join(install_dir, viewer_root, viewer_logs)
+            viewer_ai_log = os.path.join(base_viewer_logs, "ai_service.log"); viewer_be_log = os.path.join(base_viewer_logs, "imaging-service.log"); viewer_etl_log = os.path.join(base_viewer_logs, "imaging-etl.log"); viewer_fe_log = os.path.join(base_viewer_logs, "nginx_error.log"); viewer_n4j_log = os.path.join(base_viewer_logs, "neo4j.log")
+        elif not install_dir : messagebox.showwarning("Config Warning", "'INSTALL_DIR' not found. Viewer log paths will be empty.")
+        SERVICE_LOG_PATHS = {
+            "CAST Imaging Analysis Node": os.path.join(base_dir_others, "CAST-Imaging-Analysis-Node", "logs", "analysis-node.log") if base_dir_others else "", "CAST Imaging Authentication": os.path.join(base_dir_others, "CAST-Imaging-Auth-Service", "auth-service.log") if base_dir_others else "",
+            "CAST Imaging Console": os.path.join(base_dir_others, "CAST-Imaging-Console", "logs", "aip-gateway.log") if base_dir_others else "", "CAST Imaging Dashboards": os.path.join(base_dir_others, "CAST-Imaging-Dashboards", "logs", "restapi.log") if base_dir_others else "",
+            "CAST Imaging Control Panel": os.path.join(base_dir_others, "CAST-Imaging-Control-Panel", "control-panel.log") if base_dir_others else "", "CAST Imaging Gateway": os.path.join(base_dir_others, "CAST-Imaging-Gateway", "gateway.log") if base_dir_others else "",
+            "CAST Imaging SSO": os.path.join(base_dir_others, "CAST-Imaging-SSO", "logs", "CAST-Imaging-SSO-log.txt") if base_dir_others else "", "CAST Imaging Viewer AI Manager": viewer_ai_log, "CAST Imaging Viewer Backend": viewer_be_log, "CAST Imaging Viewer ETL": viewer_etl_log,
+            "CAST Imaging Viewer Frontend": viewer_fe_log, "CAST Imaging Viewer Neo4j Graph DB": viewer_n4j_log
+        }
+        for s, p in SERVICE_LOG_PATHS.items(): 
+            if p: SERVICE_LOG_PATHS[s] = os.path.normpath(p)
+        refresh_table(); populate_common_data_tab(); populate_delivery_tab(force_reparse_index=True)
+        messagebox.showinfo("Execution Complete", f"Config processed. Data refreshed.\nINSTALL_DIR: {install_dir or 'N/A'}\nOther Logs Base: {base_dir_others or 'N/A'}\nSHARED: {parsed_config_values_global.get('SHARED_FOLDER', 'N/A')}\nDELIVERY: {parsed_config_values_global.get('DELIVERY_FOLDER', 'N/A')}")
+    except Exception as e: error_details = traceback.format_exc(); messagebox.showerror("Execution Error", f"An unexpected error occurred during execution: {str(e)}\nCheck console for details."); print(f"Full traceback for execution error:\n{error_details}")
+
+apply_btn.config(command=update_all_data_sources)
+delivery_search_button.config(command=lambda: populate_delivery_tab(search_term=delivery_search_entry_var.get()))
+delivery_clear_button.config(command=lambda: (delivery_search_entry_var.set(""), populate_delivery_tab()))
+delivery_search_entry.bind("<Return>", lambda event: populate_delivery_tab(search_term=delivery_search_entry_var.get()))
+
+def get_service_status(display_name):
+    try:
+        for service in psutil.win_service_iter():
+            try:
+                if service.display_name() == display_name: status = service.status(); psutil_map = {"running": "Running", "stopped": "Stopped", "start_pending": "StopPending", "stop_pending": "StopPending", "paused": "Stopped"}; return status_icons.get(psutil_map.get(status, "Not Found"), status.capitalize())
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.TimeoutExpired, OSError): continue
+    except Exception: pass
+    return "Not Found"
+
+def refresh_table():
+    for item in tree.get_children(): tree.delete(item)
+    for service_name in SERVICE_NAMES: tree.insert("", tk.END, iid=service_name, values=(service_name, "Checking..."), tags=("NotFound",))
+
+def update_service_table():
+    def update():
+        for service_name in SERVICE_NAMES:
+            display_status = get_service_status(service_name); tag = "NotFound"; 
+            if display_status == "Running": tag = "Running"
+            elif display_status == "Stopped": tag = "Stopped"
+            elif display_status == "Stopping": tag = "StopPending"
+            if tree.exists(service_name): tree.item(service_name, values=(service_name, display_status), tags=(tag,))
+        root.after(7000, update)
+    update()
+
+def show_log(service_name):
+    log_path = SERVICE_LOG_PATHS.get(service_name); log_display.delete("1.0", tk.END)
+    if not log_path: log_display.insert(tk.END, f"Log path for {service_name} not configured."); return
+    if not os.path.exists(log_path): log_display.insert(tk.END, f"Log file not found: {service_name}\nPath: {log_path}"); return
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="ignore") as file:
+            lines = file.readlines(); errors = [l for l in lines if 'error' in l.lower()]
+            log_display.insert(tk.END, f"--- {service_name} ({os.path.basename(log_path)}) ---\n")
+            if errors: log_display.insert(tk.END, "Errors:\n\n" + ''.join(errors))
+            elif lines: log_display.insert(tk.END, "Last 100 lines:\n\n" + ''.join(lines[-100:]))
+            else: log_display.insert(tk.END, "Log empty.")
+    except Exception as e: log_display.insert(tk.END, f"Failed to read log: {log_path}\nError: {str(e)}")
+
+row, col, MAX_COLS = 0, 0, 2; button_width = 35
+for i, name in enumerate(SERVICE_NAMES):
+    btn = tk.Button(button_frame, text=name, width=button_width, height=2, bg="#1c87c9", fg="white", command=lambda n=name: show_log(n))
+    btn.grid(row=row, column=col, padx=5, pady=5, sticky="ew"); button_frame.columnconfigure(col, weight=1)
+    col += 1; 
+    if col >= MAX_COLS: col = 0; row += 1
+
+# --- Initial calls ---
+refresh_table()
+update_service_table()
+populate_common_data_tab()
+populate_delivery_tab()
+
+def on_closing():
+    if db_connection: disconnect_db()
+    root.destroy()
+root.protocol("WM_DELETE_WINDOW", on_closing)
+
+root.mainloop()
